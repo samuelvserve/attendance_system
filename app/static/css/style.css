@@ -1,0 +1,11 @@
+/*
+ * DEPRECATED — this stylesheet is no longer used.
+ *
+ * The UI was rebuilt into a modular design system. Styles now live in:
+ *   tokens.css      design tokens (color, type, space, radius, shadow, motion)
+ *   base.css        reset + base element styles
+ *   layout.css      application shell (sidebar, topbar, grids, responsive)
+ *   components.css  reusable components (buttons, cards, tables, toasts…)
+ *
+ * index.html links those four files directly. This file can be safely deleted.
+ */
