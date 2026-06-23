@@ -226,17 +226,23 @@ async def upload_files(
 async def process_files_background(file_paths: List[str], temp_dir: str, task_id: str, websocket: WebSocket):
     """Background task to process files with real-time updates"""
     try:
-        # Send initial status
         await manager.send_log(websocket, "🚀 Starting file processing...", "info")
         await manager.send_progress(websocket, 5, "Initializing...")
-        
-        # Determine file type and process
+
+        # Build a sync log_cb that fires WebSocket messages via asyncio
+        import asyncio
+        loop = asyncio.get_event_loop()
+
+        def log_cb(msg, log_type="info"):
+            asyncio.run_coroutine_threadsafe(
+                manager.send_log(websocket, msg, log_type), loop
+            )
+
         if len(file_paths) == 1:
             infile = file_paths[0]
-            await manager.send_log(websocket, f"📄 Processing file: {os.path.basename(infile)}", "info")
+            await manager.send_log(websocket, f"📄 Reading file: {os.path.basename(infile)}", "info")
             await manager.send_progress(websocket, 10, "Reading file...")
-            
-            # Read file
+
             ext = os.path.splitext(infile)[1].lower()
             if ext == '.csv':
                 import charset_normalizer
@@ -247,78 +253,112 @@ async def process_files_background(file_paths: List[str], temp_dir: str, task_id
                 df = pd.read_csv(infile, sep=None, engine='python', encoding=encoding, dtype=str)
             elif ext in ('.xls', '.xlsx', '.xlsm'):
                 df = pd.read_excel(infile)
+            else:
+                raise ValueError(f"Unsupported file type: {ext}")
 
             df = df.rename(columns=lambda x: x.strip())
             df = df.map(lambda x: x.strip() if isinstance(x, str) else x)
-            
             for column in df.columns:
                 df[column] = df[column].replace(r'^\s+|\s+$', '', regex=True)
 
-            await manager.send_progress(websocket, 20, "Processing data...")
-            
-            # Process based on file type
+            await manager.send_progress(websocket, 20, "Detecting file type...")
+
             if 'Punch Records' in df.columns:
-                await manager.send_log(websocket, "🔄 Processing Biometric data...", "info")
-                df = process_biometric_data(df)
+                await manager.send_log(websocket, "🔄 Detected: Biometric data", "info")
+                await manager.send_progress(websocket, 25, "Processing Biometric data...")
+                df = process_biometric_data(df, log_cb=log_cb)
                 source_type = 'Biometric Attendance'
-            elif "Expected Hours" in df.columns:
-                await manager.send_log(websocket, "🔄 Processing Timechamp data...", "info")
-                df = process_timechamp_data(df)
+            elif 'Expected Hours' in df.columns:
+                await manager.send_log(websocket, "🔄 Detected: Timechamp data", "info")
+                await manager.send_progress(websocket, 25, "Processing Timechamp data...")
+                df = process_timechamp_data(df, log_cb=log_cb)
                 source_type = 'Timechamp Attendance'
             elif 'Manual Hours' in df.columns:
-                await manager.send_log(websocket, "🔄 Processing Manual Tracking data...", "info")
-                df = process_manualtime_data(df)
+                await manager.send_log(websocket, "🔄 Detected: Manual Tracking data", "info")
+                await manager.send_progress(websocket, 25, "Processing Manual Tracking data...")
+                df = process_manualtime_data(df, log_cb=log_cb)
                 source_type = 'Manualtime Attendance'
             else:
-                raise ValueError("Unknown file format. Please check the file headers.")
+                raise ValueError("Unknown file format — check that file has correct headers (Punch Records / Expected Hours / Manual Hours).")
+
         else:
-            # Consolidate multiple files
-            await manager.send_log(websocket, f"📚 Consolidating {len(file_paths)} files...", "info")
-            await manager.send_progress(websocket, 15, "Consolidating files...")
-            
-            combined_df = pd.DataFrame()
-            for infile in file_paths:
+            # Multi-file: process each file individually then consolidate
+            await manager.send_log(websocket, f"📚 Multi-file mode: {len(file_paths)} files detected", "info")
+            await manager.send_progress(websocket, 10, "Processing individual files...")
+
+            processed_dfs = []
+            source_types  = []
+            for i, infile in enumerate(file_paths, 1):
+                fname = os.path.basename(infile)
+                await manager.send_log(websocket, f"📄 [{i}/{len(file_paths)}] Reading: {fname}", "info")
+                pct = 10 + int((i - 1) / len(file_paths) * 30)
+                await manager.send_progress(websocket, pct, f"Processing file {i}/{len(file_paths)}...")
+
                 ext = os.path.splitext(infile)[1].lower()
                 if ext == '.csv':
                     df_temp = pd.read_csv(infile, sep=None, engine='python', encoding='utf-8', dtype=str)
                 elif ext in ('.xls', '.xlsx', '.xlsm'):
                     df_temp = pd.read_excel(infile, dtype=str)
-                combined_df = pd.concat([combined_df, df_temp], ignore_index=True)
-            
-            combined_df = combined_df.sort_values(by=['Employee ID', 'Employee Name', 'Date'] if all(col in combined_df.columns for col in ['Employee ID', 'Employee Name', 'Date']) else combined_df.columns[:3])
-            if 'SL No.' in combined_df.columns:
-                combined_df.drop('SL No.', axis=1, inplace=True)
-            combined_df.insert(0, 'SL No.', range(1, len(combined_df) + 1))
-            df = combined_df
-            source_type = 'Biometric and Timechamp Consolidated'
-        
+                else:
+                    await manager.send_log(websocket, f"⚠️  Skipping unsupported file: {fname}", "warning")
+                    continue
+
+                df_temp = df_temp.rename(columns=lambda x: x.strip())
+                df_temp = df_temp.map(lambda x: x.strip() if isinstance(x, str) else x)
+
+                if 'Punch Records' in df_temp.columns:
+                    processed_dfs.append(process_biometric_data(df_temp, log_cb=log_cb))
+                    source_types.append('Biometric')
+                elif 'Expected Hours' in df_temp.columns:
+                    processed_dfs.append(process_timechamp_data(df_temp, log_cb=log_cb))
+                    source_types.append('Timechamp')
+                elif 'Manual Hours' in df_temp.columns:
+                    processed_dfs.append(process_manualtime_data(df_temp, log_cb=log_cb))
+                    source_types.append('Manual')
+                else:
+                    await manager.send_log(websocket, f"⚠️  Could not detect type for: {fname} — skipping", "warning")
+
+            if not processed_dfs:
+                raise ValueError("No valid files could be processed.")
+
+            await manager.send_log(websocket, f"🗂️  Consolidating {len(processed_dfs)} processed files...", "info")
+            await manager.send_progress(websocket, 42, "Consolidating files...")
+            df = file_consolidate(processed_dfs, log_cb=log_cb)
+            unique_sources = list(dict.fromkeys(source_types))
+            source_type = ' and '.join(unique_sources) + ' Consolidated'
+
         await manager.send_progress(websocket, 50, "Creating reports...")
         await manager.send_log(websocket, "📊 Creating pivot table...", "info")
-        
-        # Create pivot table and highlighted data
-        pivot_table = create_pivot_table(df)
+
+        pivot_table = create_pivot_table(df, log_cb=log_cb)
         
         await manager.send_progress(websocket, 70, "Creating highlighted data...")
         await manager.send_log(websocket, "⚠️ Identifying highlighted users...", "info")
-        highlight_data = create_highlighted_data(df)
+        highlight_data = create_highlighted_data(df, log_cb=log_cb)
         
         await manager.send_progress(websocket, 85, "Saving to Excel...")
         await manager.send_log(websocket, "💾 Saving Excel report...", "info")
         
         # Save to Excel
-        file_path, file_name = save_to_excel(df, pivot_table, highlight_data, source_type)
+        file_path, file_name = save_to_excel(df, pivot_table, highlight_data, source_type, log_cb=log_cb)
         
         await manager.send_progress(websocket, 95, "Finalizing...")
-        
+
+        # Unwrap Styler → plain DataFrame for all downstream operations
+        df_raw             = df.data            if hasattr(df,             'data') else df
+        highlight_data_raw = highlight_data.data if hasattr(highlight_data, 'data') else highlight_data
+
         # Get summary statistics
         summary = {
-            "total_records": len(df),
-            "employees": df['Employee ID'].nunique() if 'Employee ID' in df.columns else 0,
+            "total_records": len(df_raw),
+            "employees": int(df_raw['Employee ID'].nunique()) if 'Employee ID' in df_raw.columns else 0,
             "date_range": {
-                "start": df['Date'].min() if 'Date' in df.columns else None,
-                "end": df['Date'].max() if 'Date' in df.columns else None
+                "start": str(df_raw['Date'].min()) if 'Date' in df_raw.columns else None,
+                "end":   str(df_raw['Date'].max()) if 'Date' in df_raw.columns else None
             },
-            "attendance_summary": df['Attendance'].value_counts().to_dict() if 'Attendance' in df.columns else {},
+            "attendance_summary": {
+                k: int(v) for k, v in df_raw['Attendance'].value_counts().to_dict().items()
+            } if 'Attendance' in df_raw.columns else {},
             "source_type": source_type,
             "file_name": file_name
         }
@@ -335,8 +375,9 @@ async def process_files_background(file_paths: List[str], temp_dir: str, task_id
             return str(v)
 
         def df_to_preview(frame, max_rows=100):
-            preview = frame.head(max_rows).copy()
-            # Replace pandas NA/NaT/NaN with None first
+            # Accept both plain DataFrame and Styler
+            raw = frame.data if hasattr(frame, 'data') else frame
+            preview = raw.head(max_rows).copy()
             preview = preview.where(pd.notnull(preview), None)
             return {
                 "columns": list(preview.columns),
@@ -344,13 +385,13 @@ async def process_files_background(file_paths: List[str], temp_dir: str, task_id
                     [safe_val(cell) for cell in row]
                     for row in preview.values.tolist()
                 ],
-                "total": len(frame)
+                "total": len(raw)
             }
 
         table_data = {
-            "detailed": df_to_preview(df),
+            "detailed":    df_to_preview(df),
             "highlighted": df_to_preview(highlight_data),
-            "summary": df_to_preview(pivot_table)
+            "summary":     df_to_preview(pivot_table)
         }
         
         # Send completion
