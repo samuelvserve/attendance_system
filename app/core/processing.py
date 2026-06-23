@@ -430,13 +430,7 @@ def final_adjustments(df, log_cb=None):
     hr_df['Date']        = pd.to_datetime(hr_df['Date']).dt.date.astype(str)
 
     log_cb("🔗 Merging HR attendance with processed data...", "info")
-    # Preserve Source before merge — hr_df may have clashing columns that cause _x/_y suffixing
-    _source_backup = df['Source'].copy() if 'Source' in df.columns else None
-    # Keep only the 3 columns we need from hr_df to avoid any column collisions
-    hr_df = hr_df[['Employee ID', 'Date', 'HR Attendance']]
     df = pd.merge(df, hr_df, how='left', on=['Employee ID', 'Date'])
-    if _source_backup is not None:
-        df['Source'] = _source_backup.values
     df['HR Attendance'].fillna('No Data', inplace=True)
 
     matched   = (df['HR Attendance'] != 'No Data').sum()
@@ -608,12 +602,6 @@ def process_biometric_data(df, log_cb=None):
 
         log_cb("🔗 Merging punch data with employee master records...", "info")
         df = pd.merge(maindf, df, how='left', on='index')
-        # Drop any _x/_y duplicates created by the merge, then set Source cleanly
-        for col in list(df.columns):
-            if col.endswith('_y'):
-                df.drop(columns=[col], inplace=True)
-            elif col.endswith('_x') and col != 'Date_x':
-                df.rename(columns={col: col[:-2]}, inplace=True)
         df.rename(columns={'Team': 'Team Name'}, inplace=True)
         df['Source'] = 'Biometric'
 
@@ -681,7 +669,7 @@ def process_timechamp_data(df, log_cb=None):
         df['Source'] = 'Timechamp'
         df.rename(columns={'User': 'Employee Name'}, inplace=True)
 
-        required_cols = ['Date', 'Employee Id', 'Employee Name', 'Source', 'Team Name', 'Shift',
+        required_cols = ['Date', 'Employee Id', 'Employee Name', 'Team Name', 'Source', 'Shift',
                          'In Time', 'Out Time', 'Working Hours', 'Away Time', 'Idle Time', 'Break Time']
         missing = [c for c in required_cols if c not in df.columns]
         if missing:
